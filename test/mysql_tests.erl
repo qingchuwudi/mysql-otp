@@ -45,6 +45,48 @@
                           "  c CHAR(2)"
                           ") ENGINE=InnoDB">>).
 
+connect_synchronous_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, synchronous}]),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
+connect_asynchronous_successful_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, asynchronous}]),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
+connect_asynchronous_failing_test() ->
+    process_flag(trap_exit, true),
+    {ok, Ret, _Logged} = error_logger_acc:capture(
+        fun () ->
+            {ok, Pid} = mysql:start_link([{user, "dummy"}, {password, "junk"},
+                                          {connect_mode, asynchronous}]),
+            receive
+                {'EXIT', Pid, {error, Error}} ->
+                    true = is_access_denied(Error),
+                    ok
+            after 1000 ->
+                error(no_exit_message)
+            end
+        end
+    ),
+    ?assertEqual(ok, Ret),
+    process_flag(trap_exit, false),
+    ok.
+
+connect_lazy_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, lazy}]),
+    ?assertNot(mysql:is_connected(Pid)),
+    {ok, [<<"1">>], [[1]]} = mysql:query(Pid, <<"SELECT 1">>),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
 failing_connect_test() ->
     process_flag(trap_exit, true),
     {ok, Ret, Logged} = error_logger_acc:capture(
@@ -53,14 +95,7 @@ failing_connect_test() ->
         end),
     ?assertMatch([_|_], Logged), % some errors logged
     {error, Error} = Ret,
-    case Error of
-        {1045, <<"28000">>, <<"Access denie", _/binary>>} ->
-            ok; % MySQL 5.x, etc.
-        {1251, <<"08004">>, <<"Client does not support authentication "
-                              "protocol requested by server; consider "
-                              "upgrading MariaDB client">>} ->
-            ok % MariaDB 10.3.13
-    end,
+    true = is_access_denied(Error),
     receive
         {'EXIT', _Pid, Error} -> ok
     after 1000 ->
@@ -120,7 +155,7 @@ server_disconnect_test() ->
     process_flag(trap_exit, true),
     Options = [{user, ?user}, {password, ?password}],
     {ok, Pid} = mysql:start_link(Options),
-    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+    {ok, ok, _LoggedErrors} = error_logger_acc:capture(fun () ->
         %% Make the server close the connection after 1 second of inactivity.
         ok = mysql:query(Pid, <<"SET SESSION wait_timeout = 1">>),
         receive
@@ -162,7 +197,7 @@ keep_alive_test() ->
      receive after 70 -> ok end,
      State = get_state(Pid),
      [state, _Version, _ConnectionId, Socket | _] = tuple_to_list(State),
-     {ok, ExitMessage, LoggedErrors} = error_logger_acc:capture(fun () ->
+     {ok, ExitMessage, _LoggedErrors} = error_logger_acc:capture(fun () ->
          gen_tcp:close(Socket),
          receive
             Message -> Message
@@ -331,6 +366,55 @@ log_warnings_test() ->
                  " in INSeRT INtO foo () VaLUeS ()\n", Log2),
     ?assertEqual("Warning 1364: Field 'x' doesn't have a default value\n"
                  " in INSERT INTO foo () VALUES ()\n", Log3),
+    mysql:stop(Pid).
+
+log_slow_queries_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {log_warnings, false}, {log_slow_queries, true}]),
+    VersionStr = db_version_string(Pid),
+    try
+        Version = parse_db_version(VersionStr),
+        case is_mariadb(VersionStr) of
+            true when Version < [10, 0, 21] ->
+                throw({mariadb, version_too_small});
+            false when Version < [5, 5, 8] ->
+                throw({mysql, version_too_small});
+            _ ->
+                ok
+        end
+    of _ ->
+        ok = mysql:query(Pid, "SET long_query_time = 0.1"),
+
+        %% single statement should not include query number
+        SingleQuery = "SELECT SLEEP(0.2)",
+        {ok, _, SingleLogged} = error_logger_acc:capture( fun () ->
+            {ok, _, _} = mysql:query(Pid, SingleQuery)
+        end),
+        [{_, SingleLog}] = SingleLogged,
+        ?assertEqual("MySQL query was slow: " ++ SingleQuery ++ "\n", SingleLog),
+
+        %% multi statement should include number of slow query
+        MultiQuery = "SELECT SLEEP(0.2); " %% #1 -> slow
+                     "SELECT 1; "          %% #2 -> not slow
+                     "SET @foo = 1; "      %% #3 -> not slow, no result set
+                     "SELECT SLEEP(0.2); " %% #4 -> slow
+                     "SELECT 1",           %% #5 -> not slow
+        {ok, _, MultiLogged} = error_logger_acc:capture(fun () ->
+            {ok, _} = mysql:query(Pid, MultiQuery)
+        end),
+        [{_, MultiLog1}, {_, MultiLog2}] = MultiLogged,
+        ?assertEqual("MySQL query #1 was slow: " ++ MultiQuery ++ "\n", MultiLog1),
+        ?assertEqual("MySQL query #4 was slow: " ++ MultiQuery ++ "\n", MultiLog2)
+    catch
+        throw:{mysql, version_too_small} ->
+            error_logger:info_msg("Skipping Log Slow Queries test. Current MySQL version"
+                                  " is ~s. Required version is >= 5.5.8.~n",
+                                  [VersionStr]);
+        throw:{mariadb, version_too_small} ->
+            error_logger:info_msg("Skipping Log Slow Queries test. Current MariaDB version"
+                                  " is ~s. Required version is >= 10.0.21.~n",
+                                  [VersionStr])
+    end,
     mysql:stop(Pid).
 
 autocommit(Pid) ->
@@ -916,3 +1000,13 @@ parse_db_version(Version) ->
   [Version1 | _] = binary:split(Version, <<"-">>),
   lists:map(fun binary_to_integer/1,
             binary:split(Version1, <<".">>, [global])).
+
+is_access_denied({1045, <<"28000">>, <<"Access denie", _/binary>>}) ->
+    true; % MySQL 5.x, etc.
+is_access_denied({1698, <<"28000">>, <<"Access denie", _/binary>>}) ->
+    true; % MariaDB 10.3.15
+is_access_denied({1251, <<"08004">>, <<"Client does not support authentication "
+                                       "protocol requested", _/binary>>}) ->
+    true; % This has been observed with MariaDB 10.3.13
+is_access_denied(_) ->
+    false.

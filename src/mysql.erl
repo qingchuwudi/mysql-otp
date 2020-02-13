@@ -26,6 +26,7 @@
 -module(mysql).
 
 -export([start_link/1, stop/1, stop/2,
+         is_connected/1,
          query/2, query/3, query/4, query/5,
          execute/3, execute/4, execute/5,
          prepare/2, prepare/3, unprepare/2,
@@ -61,8 +62,6 @@
                       | {ok, [{column_names(), rows()}, ...]}
                       | {error, server_reason()}.
 
--define(default_connect_timeout, 5000).
-
 -include("exception.hrl").
 
 %% @doc Starts a connection gen_server process and connects to a database. To
@@ -88,11 +87,37 @@
 %%   <dt>`{database, Database}'</dt>
 %%   <dd>The name of the database AKA schema to use. This can be changed later
 %%       using the query `USE <database>'.</dd>
+%%   <dt>`{connect_mode, synchronous | asynchronous | lazy}'</dt>
+%%   <dd>Specifies how and when the connection process should establish a connection
+%%       to the MySQL server.
+%%       <dl>
+%%         <dt>`synchronous' (default)</dt>
+%%         <dd>The connection will be established as part of the connection process'
+%%             start routine, ie the returned connection process will already be
+%%             connected and ready to use, and any on-connect prepares and queries
+%%             will have been executed.</dd>
+%%         <dt>`asynchronous'</dt>
+%%         <dd>The connection process will be started and returned to the caller
+%%             before really establishing a connection to the server and executing
+%%             the on-connect prepares and executes. This will instead be done
+%%             immediately afterwards as the first action of the connection
+%%             process.</dd>
+%%         <dt>`lazy'</dt>
+%%         <dd>Similar to `asynchronous' mode, but an actual connection will be
+%%             established and the on-connect prepares and queries executed only
+%%             when a connection is needed for the first time, eg. to execute a
+%%             query.</dd>
+%%      </dl>
+%%   </dd>
 %%   <dt>`{connect_timeout, Timeout}'</dt>
 %%   <dd>The maximum time to spend for start_link/1.</dd>
 %%   <dt>`{log_warnings, boolean()}'</dt>
 %%   <dd>Whether to fetch warnings and log them using error_logger; default
 %%       true.</dd>
+%%   <dt>`{log_slow_queries, boolean()}'</dt>
+%%   <dd>Whether to log slow queries using error_logger; default false. Queries
+%%       are flagged as slow by the server if their execution time exceeds the
+%%       value in the `long_query_time' variable.</dd>
 %%   <dt>`{keep_alive, boolean() | timeout()}'</dt>
 %%   <dd>Send ping when unused for a certain time. Possible values are `true',
 %%       `false' and `integer() > 0' for an explicit interval in milliseconds.
@@ -138,8 +163,10 @@
                    {host, inet:socket_address() | inet:hostname()} | {port, integer()} |
                    {user, iodata()} | {password, iodata()} |
                    {database, iodata()} |
+                   {connect_mode, synchronous | asynchronous | lazy} |
                    {connect_timeout, timeout()} |
                    {log_warnings, boolean()} |
+                   {log_slow_queries, boolean()} |
                    {keep_alive, boolean() | timeout()} |
                    {prepare, NamedStatements} |
                    {queries, [iodata()]} |
@@ -155,13 +182,11 @@
                        {via, Module :: atom(), ViaName :: term()},
          NamedStatements :: [{StatementName :: atom(), Statement :: iodata()}].
 start_link(Options) ->
-    GenSrvOpts = [{timeout, proplists:get_value(connect_timeout, Options,
-                                                ?default_connect_timeout)}],
     case proplists:get_value(name, Options) of
         undefined ->
-            gen_server:start_link(mysql_conn, Options, GenSrvOpts);
+            gen_server:start_link(mysql_conn, Options, []);
         ServerName ->
-            gen_server:start_link(ServerName, mysql_conn, Options, GenSrvOpts)
+            gen_server:start_link(ServerName, mysql_conn, Options, [])
     end.
 
 %% @see stop/2.
@@ -208,7 +233,13 @@ backported_gen_server_stop(Conn, Reason, Timeout) ->
         end
     end.
 
+%% @private
+-spec is_connected(Conn) -> boolean()
+    when Conn :: connection().
+is_connected(Conn) ->
+    gen_server:call(Conn, is_connected).
 
+%% @doc Executes a plain query.
 %% @see query/5.
 -spec query(Conn, Query) -> Result
     when Conn :: connection(),
@@ -217,6 +248,7 @@ backported_gen_server_stop(Conn, Reason, Timeout) ->
 query(Conn, Query) ->
     query(Conn, Query, no_params, no_filtermap_fun, default_timeout).
 
+%% @doc Executes a query.
 %% @see query/5.
 -spec query(Conn, Query, Params | FilterMap | Timeout) -> Result
     when Conn :: connection(),
@@ -237,6 +269,7 @@ query(Conn, Query, Timeout) when Timeout == default_timeout;
                                  Timeout == infinity ->
     query(Conn, Query, no_params, no_filtermap_fun, Timeout).
 
+%% @doc Executes a query.
 %% @see query/5.
 -spec query(Conn, Query, Params, Timeout) -> Result
         when Conn :: connection(),
@@ -276,40 +309,53 @@ query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
                                             is_function(FilterMap, 2)) ->
     query(Conn, Query, Params, FilterMap, default_timeout).
 
-%% @doc Executes a parameterized query with a timeout and applies a filter/map
-%% function to the result rows.
+%% @doc Executes a query.
 %%
-%% A prepared statement is created, executed and then cached for a certain
-%% time. If the same query is executed again when it is already cached, it does
-%% not need to be prepared again.
+%% === Parameters ===
 %%
-%% The minimum time the prepared statement is cached can be specified using the
-%% option `{query_cache_time, Milliseconds}' to start_link/1.
+%% `Conn' is identifying a connection process started using
+%% `mysql:start_link/1'.
+%%
+%% `Query' is the query to execute, as a binary or a list.
+%%
+%% `Params', `FilterMap' and `Timeout' are optional.
+%%
+%% If `Params' (a list) is specified, the query is performed as a prepared
+%% statement. A prepared statement is created, executed and then cached for a
+%% certain time (specified using the option `{query_cache_time, Milliseconds}'
+%% to `start_link/1'). If the same query is executed again during this time,
+%% it does not need to be prepared again. If `Params' is omitted (or specified
+%% as `no_params'), the query is executed as a plain query. To force a query
+%% without parameters to be executed as a prepared statement, an empty list can
+%% be used for `Params'.
+%%
+%% If `FilterMap' (a fun) is specified, the function is applied to each row to
+%% filter or perform other actions on the rows, in a way similar to how
+%% `lists:filtermap/2' works, before the result is returned to the caller. See
+%% below for details.
+%%
+%% `Timeout' specifies the time to wait for a response from the database. If
+%% omitted (or specified as `default_timeout'), the timeout given in
+%% `start_link/1' is used.
+%%
+%% === Return value ===
 %%
 %% Results are returned in the form `{ok, ColumnNames, Rows}' if there is one
 %% result set. If there are more than one result sets, they are returned in the
-%% form `{ok, [{ColumnNames, Rows}, ...]}'.
+%% form `{ok, [{ColumnNames, Rows}, ...]}'. This is typically the case if
+%% multiple queries are specified at the same time, separated by semicolons.
 %%
 %% For queries that don't return any rows (INSERT, UPDATE, etc.) only the atom
 %% `ok' is returned.
 %%
-%% The `Params', `FilterMap' and `Timeout' arguments are optional.
-%% <ul>
-%%   <li>If the `Params' argument is the atom `no_params' or is omitted, a plain
-%%       query will be executed instead of a parameterized one.</li>
-%%   <li>If the `FilterMap' argument is the atom `no_filtermap_fun' or is
-%%       omitted, no row filtering/mapping will be applied and all result rows
-%%       will be returned unchanged.</li>
-%%   <li>If the `Timeout' argument is the atom `default_timeout' or is omitted,
-%%       the timeout given in `start_link/1' is used.</li>
-%% </ul>
+%% === FilterMap details ===
 %%
 %% If the `FilterMap' argument is used, it must be a function of arity 1 or 2
 %% that returns either `true', `false', or `{true, Value}'.
 %%
 %% Each result row is handed to the given function as soon as it is received
 %% from the server, and only when the function has returned, the next row is
-%% fetched. This provides the ability to prevent memory exhaustion; on the
+%% fetched. This provides the ability to prevent memory exhaustion. On the
 %% other hand, it can cause the server to time out on sending if your function
 %% is doing something slow (see the MySQL documentation on `NET_WRITE_TIMEOUT').
 %%
@@ -322,6 +368,8 @@ query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
 %% else is to be included in the result instead (mapping). You may also use
 %% this function for side effects, like writing rows to disk or sending them
 %% to another process etc.
+%%
+%% === Examples ===
 %%
 %% Here is an example showing some of the things that are possible:
 %% ```
@@ -584,6 +632,11 @@ transaction(Conn, Fun, Args, Retries) when is_list(Args),
 %% rollback does not cancel that statement."
 %% (https://dev.mysql.com/doc/refman/5.6/en/innodb-error-handling.html)
 %%
+%% This seems to have changed in MySQL 5.7.x though (although the MySQL
+%% documentation hasn't been updated). Now, also the BEGIN is cancelled, so a
+%% new BEGIN has to be issued when restarting the transaction. This has no
+%% effect on older versions, not even a warning.
+%%
 %% Lock Wait Timeout:
 %% "InnoDB rolls back only the last statement on a transaction timeout by
 %% default. If --innodb_rollback_on_timeout is specified, a transaction timeout
@@ -600,15 +653,23 @@ execute_transaction(Conn, Fun, Args, Retries) ->
         %% retries left
         ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
           when Retries == infinity ->
+            %% In MySQL < 5.7 we're not in a transaction here, but in earlier
+            %% versions we are, so we can't use `gen_server:call(Conn,
+            %% start_transaction, infinity)' here.
+            ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, infinity);
         ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
           when Retries > 0 ->
+            ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, Retries - 1);
         ?EXCEPTION(throw, {implicit_rollback, 1, Reason}, Stacktrace)
           when Retries == 0 ->
             %% No more retries. Return 'aborted' along with the deadlock error
             %% and a the trace to the line where the deadlock occured.
             Trace = ?GET_STACK(Stacktrace),
+            %% In MySQL < 5.7, we are still in a transaction here, but in 5.7+
+            %% we're not.  The ROLLBACK executed here has no effect if no
+            %% transaction is ongoing.
             ok = gen_server:call(Conn, rollback, infinity),
             {aborted, {Reason, Trace}};
         ?EXCEPTION(throw, {implicit_rollback, N, Reason}, Stacktrace)

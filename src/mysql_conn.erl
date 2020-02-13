@@ -34,6 +34,7 @@
 -define(default_port, 3306).
 -define(default_user, <<>>).
 -define(default_password, <<>>).
+-define(default_connect_timeout, 5000).
 -define(default_query_timeout, infinity).
 -define(default_query_cache_time, 60000). %% for query/3.
 -define(default_ping_timeout, 60000).
@@ -52,15 +53,15 @@
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket, sockmod, ssl_opts,
-                host, port, user, password, auth_plugin_data, log_warnings,
-                ping_timeout,
-                query_timeout, query_cache_time,
+-record(state, {server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
+                host, port, user, password, database, queries, prepares,
+                auth_plugin_name, auth_plugin_data,
+                log_warnings, log_slow_queries,
+                connect_timeout, ping_timeout, query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
                 stmts = dict:new(), query_cache = empty, cap_found_rows = false,
-                queries, prepare,
-                database, socket_opts,
+                socket_opts,
                 reconnect_pid, reconnect_interval, reconnect_timeout}).
 
 %% @private
@@ -78,15 +79,17 @@ init(Opts) ->
     Password       = proplists:get_value(password, Opts, ?default_password),
     Database       = proplists:get_value(database, Opts, undefined),
     LogWarn        = proplists:get_value(log_warnings, Opts, true),
+    LogSlow        = proplists:get_value(log_slow_queries, Opts, false),
     KeepAlive      = proplists:get_value(keep_alive, Opts, false),
-    Timeout        = proplists:get_value(query_timeout, Opts,
+    ConnectTimeout = proplists:get_value(connect_timeout, Opts,
+                                         ?default_connect_timeout),
+    QueryTimeout   = proplists:get_value(query_timeout, Opts,
                                          ?default_query_timeout),
     QueryCacheTime = proplists:get_value(query_cache_time, Opts,
                                          ?default_query_cache_time),
     TcpOpts        = proplists:get_value(tcp_options, Opts, []),
     SetFoundRows   = proplists:get_value(found_rows, Opts, false),
     SSLOpts        = proplists:get_value(ssl, Opts, undefined),
-    SockMod0       = gen_tcp,
 
     Queries        = proplists:get_value(queries, Opts, []),
     Prepares       = proplists:get_value(prepare, Opts, []),
@@ -102,10 +105,67 @@ init(Opts) ->
         N when N > 0 -> N
     end,
 
+    State0 = #state{
+        tcp_opts = TcpOpts,
+        ssl_opts = SSLOpts,
+        host = Host, port = Port,
+        user = User, password = Password,
+        database = Database,
+        queries = Queries, prepares = Prepares,
+        log_warnings = LogWarn, log_slow_queries = LogSlow,
+        connect_timeout = ConnectTimeout,
+        ping_timeout = PingTimeout,
+        query_timeout = QueryTimeout,
+        query_cache_time = QueryCacheTime,
+        cap_found_rows = (SetFoundRows =:= true),
+        reconnect_interval = ReconnectInterval,
+        reconnect_timeout = seconds(ReconnectTimeout)
+    },
+
+    case proplists:get_value(connect_mode, Opts, synchronous) of
+        synchronous ->
+            case connect(State0) of
+                {ok, State1} ->
+                    {ok, State1};
+                {error, Reason} ->
+                    {stop, Reason}
+            end;
+        asynchronous ->
+            gen_server:cast(self(), connect),
+            {ok, State0};
+        lazy ->
+            {ok, State0}
+    end.
+
+connect(#state{connect_timeout = ConnectTimeout} = State) ->
+    MainPid = self(),
+    Pid = spawn_link(
+        fun () ->
+            {ok, State1}=connect_socket(State),
+            case handshake(State1) of
+                {ok, #state{sockmod = SockMod, socket = Socket} = State2} ->
+                    SockMod:controlling_process(Socket, MainPid),
+                    MainPid ! {self(), {ok, State2}};
+                {error, _} = E ->
+                    MainPid ! {self(), E}
+            end
+        end
+    ),
+    receive
+        {Pid, {ok, State3}} ->
+            post_connect(State3);
+        {Pid, {error, _} = E} ->
+            E
+    after ConnectTimeout ->
+        unlink(Pid),
+        exit(Pid, kill),
+        {error, timeout}
+    end.
+
+connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
     %% Connect socket
-    SockOpts = [binary, {packet, raw}, {active, false}, {nodelay, true}
-                | TcpOpts],
-    {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
+    SockOpts = sanitize_tcp_opts(TcpOpts),
+    {ok, Socket} = gen_tcp:connect(Host, Port, SockOpts),
 
     %% If buffer wasn't specifically defined make it at least as
     %% large as recbuf, as suggested by the inet:setopts() docs.
@@ -113,60 +173,76 @@ init(Opts) ->
         true ->
             ok;
         false ->
-            {ok, [{buffer, Buffer}]} = inet:getopts(Socket0, [buffer]),
-            {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket0, [recbuf]),
-            ok = inet:setopts(Socket0,[{buffer, max(Buffer, Recbuf)}])
+            {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
+            {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
+            ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
     end,
 
+    {ok, State#state{socket = Socket}}.
+
+sanitize_tcp_opts(TcpOpts0) ->
+    TcpOpts1 = lists:filter(
+        fun
+            ({mode, _}) -> false;
+            (binary) -> false;
+            (list) -> false;
+            ({packet, _}) -> false;
+            ({active, _}) -> false;
+            (_) -> true
+        end,
+        TcpOpts0
+    ),
+    TcpOpts2 = case lists:keymember(nodelay, 1, TcpOpts1) of
+        true -> TcpOpts1;
+        false -> [{nodelay, true} | TcpOpts1]
+    end,
+    [binary, {packet, raw}, {active, false} | TcpOpts2].
+
+handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
+        user = User, password = Password, database = Database,
+        cap_found_rows = SetFoundRows} = State0) ->
     %% Exchange handshake communication.
-    Result = mysql_protocol:handshake(User, Password, Database, SockMod0, SSLOpts,
+    Result = mysql_protocol:handshake(User, Password, Database, gen_tcp, SSLOpts,
                                       Socket0, SetFoundRows),
     case Result of
         {ok, Handshake, SockMod, Socket} ->
             setopts(SockMod, Socket, [{active, once}]),
             #handshake{server_version = Version, connection_id = ConnId,
                        status = Status,
+                       auth_plugin_name = AuthPluginName,
                        auth_plugin_data = AuthPluginData} = Handshake,
-            State = #state{server_version = Version, connection_id = ConnId,
-                           database = Database, queries = Queries, prepare = Prepares,
+            State1 = State0#state{server_version = Version, connection_id = ConnId,
                            sockmod = SockMod,
                            socket = Socket,
-                           ssl_opts = SSLOpts,
-                           host = Host, port = Port,
-                           user = User, password = Password,
+                           auth_plugin_name = AuthPluginName,
                            auth_plugin_data = AuthPluginData,
-                           status = Status,
-                           log_warnings = LogWarn,
-                           ping_timeout = PingTimeout,
-                           query_timeout = Timeout,
-                           query_cache_time = QueryCacheTime,
-                           cap_found_rows = (SetFoundRows =:= true),
-                           socket_opts = SockOpts,
-                           reconnect_interval = ReconnectInterval,
-                           reconnect_timeout = seconds(ReconnectTimeout)},
-            case execute_on_connect(Queries, Prepares, State) of
-                {ok, State1} ->
-                    process_flag(trap_exit, true),
-                    State2 = schedule_ping(State1),
-                    {ok, State2};
-                {error, Reason} ->
-                    {stop, Reason}
-            end;
+                           status = Status},
+            {ok, State1};
         #error{} = E ->
-            {stop, error_to_reason(E)}
+            {error, error_to_reason(E)}
+    end.
+
+post_connect(#state{queries = Queries, prepares = Prepares} = State) ->
+    case execute_on_connect(Queries, Prepares, State) of
+        {ok, State1} ->
+            process_flag(trap_exit, true),
+            State2 = schedule_ping(State1),
+            {ok, State2};
+        {error, _} = E ->
+            E
     end.
 
 execute_on_connect([], [], State) ->
     {ok, State};
 execute_on_connect([], [{Name, Stmt}|Prepares], State) ->
-    case do_named_prepare(Name, Stmt, State) of
+    case named_prepare(Name, Stmt, State) of
         {{ok, Name}, State1} ->
             execute_on_connect([], Prepares, State1);
         {{error, _} = E, _} ->
             E
     end;
 execute_on_connect([Query|Queries], Prepares, State) ->
-    case do_query(Query, no_filtermap_fun, default_timeout, State) of
+    case query(Query, no_filtermap_fun, default_timeout, State) of
         {ok, State1} ->
             execute_on_connect(Queries, Prepares, State1);
         {{ok, _}, State1} ->
@@ -219,8 +295,17 @@ handle_call(state, _From, #state{socket = undefined} = State) ->
     {reply, State, State};
 handle_call(_, _From, #state{socket = undefined} = State) ->
     {reply, {error, reconnecting}, State};
+handle_call(is_connected, _, #state{socket = Socket} = State) ->
+    {reply, Socket =/= undefined, State};
+handle_call(Msg, From, #state{socket = undefined} = State) ->
+    case connect(State) of
+        {ok, State1} ->
+            handle_call(Msg, From, State1);
+        {error, _} = E ->
+            {stop, E, State}
+    end;
 handle_call({query, Query, FilterMap, Timeout}, _From, State) ->
-    {Reply, State1} = do_query(Query, FilterMap, Timeout, State),
+    {Reply, State1} = query(Query, FilterMap, Timeout, State),
     {reply, Reply, State1};
 handle_call({param_query, Query, Params, FilterMap, default_timeout}, From,
             State) ->
@@ -255,7 +340,8 @@ handle_call({param_query, Query, Params, FilterMap, Timeout}, _From,
     case StmtResult of
         {ok, StmtRec} ->
             State1 = State#state{query_cache = Cache1},
-            execute_stmt(StmtRec, Params, FilterMap, Timeout, State1);
+            {Reply, State2} = execute_stmt(StmtRec, Params, FilterMap, Timeout, State1),
+            {reply, Reply, State2};
         PrepareError ->
             {reply, PrepareError, State}
     end;
@@ -265,7 +351,8 @@ handle_call({execute, Stmt, Args, FilterMap, default_timeout}, From, State) ->
 handle_call({execute, Stmt, Args, FilterMap, Timeout}, _From, State) ->
     case dict:find(Stmt, State#state.stmts) of
         {ok, StmtRec} ->
-            execute_stmt(StmtRec, Args, FilterMap, Timeout, State);
+            {Reply, State1} = execute_stmt(StmtRec, Args, FilterMap, Timeout, State),
+            {reply, Reply, State1};
         error ->
             {reply, {error, not_prepared}, State}
     end;
@@ -284,7 +371,7 @@ handle_call({prepare, Query}, _From, State) ->
             {reply, {ok, Id}, State2}
     end;
 handle_call({prepare, Name, Query}, _From, State) when is_atom(Name) ->
-    {Reply, State1} = do_named_prepare(Name, Query, State),
+    {Reply, State1} = named_prepare(Name, Query, State),
     {reply, Reply, State1};
 handle_call({unprepare, Stmt}, _From, State) when is_atom(Stmt);
                                                   is_integer(Stmt) ->
@@ -303,6 +390,7 @@ handle_call({unprepare, Stmt}, _From, State) when is_atom(Stmt);
 handle_call({change_user, Username, Password, Options}, From,
             State = #state{transaction_levels = []}) ->
     #state{socket = Socket, sockmod = SockMod,
+           auth_plugin_name = AuthPluginName,
            auth_plugin_data = AuthPluginData,
            server_version = ServerVersion} = State,
     Database = proplists:get_value(database, Options, undefined),
@@ -310,7 +398,7 @@ handle_call({change_user, Username, Password, Options}, From,
     Prepares = proplists:get_value(prepare, Options, []),
     setopts(SockMod, Socket, [{active, false}]),
     Result = mysql_protocol:change_user(SockMod, Socket, Username, Password,
-                                        AuthPluginData, Database,
+                                        AuthPluginName, AuthPluginData, Database,
                                         ServerVersion),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Result, State),
@@ -319,8 +407,10 @@ handle_call({change_user, Username, Password, Options}, From,
     State2 = State1#state{query_cache = empty, stmts = dict:new()},
     case Result of
         #ok{} ->
-            State3 = State2#state{user = Username, password = Password},
-            case execute_on_connect(Queries, Prepares, State3) of
+            State3 = State2#state{user = Username, password = Password,
+                                  database=Database, queries=Queries,
+                                  prepares=Prepares},
+            case post_connect(State3) of
                 {ok, State4} ->
                     {reply, ok, State4};
                 {error, Reason} = E ->
@@ -413,6 +503,15 @@ handle_cast({connection_ready, #state{host = Host,
 handle_cast(reconnect_timeout, State) ->
     stop_server({error, reconnect_timeout}, State);
 
+handle_cast(connect, #state{socket = undefined} = State) ->
+    case connect(State) of
+        {ok, State1} ->
+            {noreply, State1};
+        {error, _} = E ->
+            {stop, E, State}
+    end;
+handle_cast(connect, State) ->
+    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -468,7 +567,7 @@ code_change(_OldVsn, _State, _Extra) ->
 
 %% --- Helpers ---
 
-%% @doc Executes a prepared statement and returns {reply, Reply, NextState}.
+%% @doc Executes a prepared statement and returns {Reply, NewState}.
 execute_stmt(Stmt, Args, FilterMap, Timeout,
              State = #state{socket = Socket, sockmod = SockMod}) ->
     setopts(SockMod, Socket, [{active, false}]),
@@ -489,8 +588,7 @@ execute_stmt(Stmt, Args, FilterMap, Timeout,
     State1 = lists:foldl(fun update_state/2, State, Recs),
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, Stmt#prepared.orig_query),
-    {Reply, State2} = handle_query_call_result(Recs, Stmt#prepared.orig_query, State1, []),
-    {reply, Reply, State2}.
+    handle_query_call_result(Recs, Stmt#prepared.orig_query, State1).
 
 %% @doc Produces a tuple to return as an error reason.
 -spec error_to_reason(#error{}) -> mysql:server_reason().
@@ -517,11 +615,11 @@ update_state(Rec, State) ->
     schedule_ping(State1).
 
 %% @doc executes an unparameterized query and returns {Reply, NewState}.
-do_query(Query, FilterMap, default_timeout,
-            #state{query_timeout = DefaultTimeout} = State) ->
-    do_query(Query, FilterMap, DefaultTimeout, State);
-do_query(Query, FilterMap, Timeout,
-            #state{sockmod = SockMod, socket = Socket} = State) ->
+query(Query, FilterMap, default_timeout,
+      #state{query_timeout = DefaultTimeout} = State) ->
+    query(Query, FilterMap, DefaultTimeout, State);
+query(Query, FilterMap, Timeout,
+      #state{sockmod = SockMod, socket = Socket} = State) ->
     setopts(SockMod, Socket, [{active, false}]),
     Result = mysql_protocol:query(Query, SockMod, Socket, FilterMap, Timeout),
     {ok, Recs} = case Result of
@@ -540,11 +638,11 @@ do_query(Query, FilterMap, Timeout,
     State1 = lists:foldl(fun update_state/2, State, Recs),
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, Query),
-    handle_query_call_result(Recs, Query, State1, []).
+    handle_query_call_result(Recs, Query, State1).
 
 %% @doc Prepares a named query and returns {{ok, Name}, NewState} or
 %% {{error, Reason}, NewState}.
-do_named_prepare(Name, Query, State) ->
+named_prepare(Name, Query, State) ->
     #state{socket = Socket, sockmod = SockMod} = State,
     %% First unprepare if there is an old statement with this name.
     setopts(SockMod, Socket, [{active, false}]),
@@ -569,13 +667,24 @@ do_named_prepare(Name, Query, State) ->
 
 %% @doc Transforms result sets into a structure appropriate to be returned
 %% to the client.
-handle_query_call_result([], _Query, State, []) ->
+handle_query_call_result([_] = Recs, Query, State) ->
+    handle_query_call_result(Recs, not_applicable, Query, State, []);
+handle_query_call_result(Recs, Query, State) ->
+    handle_query_call_result(Recs, 1, Query, State, []).
+
+handle_query_call_result([], _RecNum, _Query, State, []) ->
     {ok, State};
-handle_query_call_result([], _Query, State, [{ColumnNames, Rows}]) ->
+handle_query_call_result([], _RecNum, _Query, State, [{ColumnNames, Rows}]) ->
     {{ok, ColumnNames, Rows}, State};
-handle_query_call_result([], _Query, State, ResultSetsAcc) ->
+handle_query_call_result([], _RecNum, _Query, State, ResultSetsAcc) ->
     {{ok, lists:reverse(ResultSetsAcc)}, State};
-handle_query_call_result([Rec|Recs], Query, State = #state{transaction_levels = L}, ResultSetsAcc) ->
+handle_query_call_result([Rec|Recs], RecNum, Query,
+                         #state{transaction_levels = L} = State,
+                         ResultSetsAcc) ->
+    RecNum1 = case RecNum of
+        not_applicable -> not_applicable;
+        _ -> RecNum + 1
+    end,
     case Rec of
         #ok{status = Status} when Status band ?SERVER_STATUS_IN_TRANS == 0,
                                   L /= [] ->
@@ -585,17 +694,20 @@ handle_query_call_result([Rec|Recs], Query, State = #state{transaction_levels = 
             Reply = {implicit_commit, Length, Query},
             [] = demonitor_processes(L, Length),
             {Reply, State#state{transaction_levels = []}};
-        #ok{} ->
-            handle_query_call_result(Recs, Query, State, ResultSetsAcc);
-        #resultset{cols = ColDefs, rows = Rows} ->
+        #ok{status = Status} ->
+            maybe_log_slow_query(State, Status, RecNum, Query),
+            handle_query_call_result(Recs, RecNum1, Query, State, ResultSetsAcc);
+        #resultset{cols = ColDefs, rows = Rows, status = Status} ->
             Names = [Def#col.name || Def <- ColDefs],
             ResultSetsAcc1 = [{Names, Rows} | ResultSetsAcc],
-            handle_query_call_result(Recs, Query, State, ResultSetsAcc1);
+            maybe_log_slow_query(State, Status, RecNum, Query),
+            handle_query_call_result(Recs, RecNum1, Query, State, ResultSetsAcc1);
         #error{code = ?ERROR_DEADLOCK} when L /= [] ->
             %% These errors result in an implicit rollback.
             Reply = {implicit_rollback, length(L), error_to_reason(Rec)},
-            %% Everything in the transaction is rolled back, except the BEGIN
-            %% statement itself. Thus, we are in transaction level 1.
+            %% The transaction is rollbacked, except the BEGIN, so we're still
+            %% in a transaction.  (In 5.7+, also the BEGIN has been rolled back,
+            %% but here we assume the old behaviour.)
             NewMonitors = demonitor_processes(L, length(L) - 1),
             {Reply, State#state{transaction_levels = NewMonitors}};
         #error{} ->
@@ -619,6 +731,28 @@ log_warnings(#state{socket = Socket, sockmod = SockMod}, Query) ->
     Lines = [[Level, " ", integer_to_binary(Code), ": ", Message, "\n"]
              || [Level, Code, Message] <- Rows],
     error_logger:warning_msg("~s in ~s~n", [Lines, Query]).
+
+%% @doc Logs slow queries. Query is the query that gave the warnings.
+maybe_log_slow_query(#state{log_slow_queries = true}, S, RecNum, Query)
+  when S band ?SERVER_QUERY_WAS_SLOW /= 0 ->
+    IndexHint = if
+        S band ?SERVER_STATUS_NO_GOOD_INDEX_USED /= 0 ->
+            " (with no good index)";
+        S band ?SERVER_STATUS_NO_INDEX_USED /= 0 ->
+            " (with no index)";
+        true ->
+            ""
+    end,
+    QueryNumHint = case RecNum of
+        not_applicable ->
+            "";
+        _ ->
+            io_lib:format(" #~b", [RecNum])
+    end,
+    error_logger:warning_msg("MySQL query~s~s was slow: ~s~n",
+                             [QueryNumHint, IndexHint, Query]);
+maybe_log_slow_query(_, _, _, _) ->
+    ok.
 
 %% @doc Makes a separate connection and execute KILL QUERY. We do this to get
 %% our main connection back to normal. KILL QUERY appeared in MySQL 5.0.0.
@@ -644,6 +778,8 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
                                    [error_to_reason(E)])
     end.
 
+stop_server(Reason, #state{socket = undefined} = State) ->
+  {stop, Reason, State};
 stop_server(Reason,
             #state{socket = Socket, connection_id = ConnId} = State) ->
   error_logger:error_msg("Connection Id ~p closing with reason: ~p~n",
@@ -710,7 +846,7 @@ reconnect_loop(Timeout, Interval, Client, State) when (Timeout > 0) orelse (infi
         %% Something bad happened when connecting, like mysql might be
         %% loading the dataset and we got something other than 'OK' in
         %% auth
-        _ ->
+        _E ->
             timer:sleep(Interval),
             reconnect_loop(NewTimeout, Interval, Client, State)
     end;
@@ -729,11 +865,12 @@ get_all_messages() ->
     after   0 -> ok
     end.
 
-connecting(#state{ssl_opts = SSLOpts, cap_found_rows = SetFoundRows,
+connecting(#state{ssl_opts = SSLOpts, cap_found_rows = SetFoundRows, tcp_opts = TcpOpts,
                   host = Host, port = Port, user = User, password = Password,
-                  queries = Queries, prepare = Prepares,
-                  database = Database, socket_opts = SockOpts} = State) ->
-
+                  queries = Queries, prepares = Prepares,
+                  database = Database} = State) ->
+    %% Connect socket
+    SockOpts = sanitize_tcp_opts(TcpOpts),
     {ok, Socket0} = gen_tcp:connect(Host, Port, SockOpts),
 
     %% If buffer wasn't specifically defined make it at least as
@@ -764,12 +901,7 @@ connecting(#state{ssl_opts = SSLOpts, cap_found_rows = SetFoundRows,
                            warning_count = 0,
                            insert_id = 0,
                            reconnect_pid = undefined},
-            case execute_on_connect(Queries, Prepares, State1) of
-                {ok, State2} ->
-                    {ok, State2};
-                {error, Reason} ->
-                    {stop, Reason}
-            end;
+            execute_on_connect(Queries, Prepares, State1);
         #error{} = E ->
-            {stop, error_to_reason(E)}
+            {error, error_to_reason(E)}
     end.
